@@ -1,0 +1,45 @@
+# Secrets
+.env
+.env.local
+
+# Runtime data — NEVER commit personal bookings
+*.json
+!package.json
+!package-lock.json
+buchungen*.json
+kategorien*.json
+pin.json
+caldav.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Personal data dir (separate from repo)
+.buchhalter-bot/
+data/
+
+# Temp
+tmp/
+*.tmp
