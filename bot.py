@@ -811,6 +811,24 @@ def _detect_farsi(text):
     return farsi_count > len(text) * 0.15 if text else False
 
 
+def _llm_fehler_text(e):
+    """Wandelt eine LLM-Router-Ausnahme in eine nutzerfreundliche Meldung um.
+    Verhindert, dass rohe Provider-Fehler/Stacktraces im Telegram-Chat landen.
+    Buchen & Abfragen laufen ohne LLM weiter — nur Smart-Features pausieren."""
+    detail = (str(e) or e.__class__.__name__).lower()
+    if "not logged in" in detail or "/login" in detail or "setup-token" in detail \
+            or "auth" in detail or "token" in detail or "401" in detail:
+        return ("🔌 KI-Login ist abgelaufen. Buchen & Abfragen funktionieren "
+                "normal weiter — nur Smart-Fragen pausieren, bis der Claude-/LLM-"
+                "Login auf dem Server erneuert ist.")
+    if "llmunavailable" in detail or "provider" in detail or "alle llm" in detail \
+            or "rate" in detail or "quota" in detail or "timeout" in detail:
+        return ("🔌 KI gerade nicht erreichbar. Buchen & Abfragen laufen normal "
+                "weiter — versuch die Smart-Frage gleich nochmal.")
+    return ("⚠️ KI-Anfrage fehlgeschlagen. Buchen & Abfragen funktionieren "
+            "normal weiter. Bitte später nochmal versuchen.")
+
+
 def ki_frage(frage_text):
     """Wrapper: leitet automatisch an ki_frage_smart weiter mit Spracherkennung."""
     lang = "fa" if _detect_farsi(frage_text) else "de"
@@ -926,7 +944,8 @@ def ki_frage_smart(frage_text, lang="fa"):
     try:
         from llm_router import ask
     except ImportError:
-        return "LLM Router nicht verfuegbar", "none"
+        return ("🔌 KI-Modul nicht verfügbar. Buchen & Abfragen laufen normal weiter.",
+                "none")
 
     kontext = _build_smart_context()
 
@@ -951,7 +970,11 @@ def ki_frage_smart(frage_text, lang="fa"):
     )
 
     prompt = f"Buchungsdaten (Aggregate):\n{kontext}\n\nFrage: {frage_text}"
-    result, provider = ask(prompt, system=system, max_tokens=800)
+    try:
+        result, provider = ask(prompt, system=system, max_tokens=800)
+    except Exception as e:
+        print(f"[ki_frage_smart] LLM-Fehler: {e}")
+        return _llm_fehler_text(e), "error"
     return result, provider
 
 
@@ -1366,7 +1389,7 @@ def _process_edit_command(text, uid, cid):
     except Exception as e:
         print(f"Edit Command Error: {e}")
         import traceback; traceback.print_exc()
-        bot.send_message(cid, f"❌ Fehler: {e}")
+        bot.send_message(cid, _llm_fehler_text(e))
 
 
 def _execute_edit_actions(actions):
@@ -2900,7 +2923,8 @@ def callback_handler(call):
                 prompt = f"{kontext}\n\nلطفاً ۳ پیشنهاد صرفه‌جویی بده."
                 antwort, provider = ask(prompt, system=system, max_tokens=600)
             except Exception as e:
-                antwort, provider = f"❌ {e}", "error"
+                print(f"[spar_tipps] LLM-Fehler: {e}")
+                antwort, provider = _llm_fehler_text(e), "error"
             _zeige_ki_antwort(cid, antwort, provider)
         
         elif data == "ki_q_custom":
@@ -3841,8 +3865,9 @@ def _exec_smart_q(target_cid, frage, lang="fa", uid=None):
         antwort, provider = ki_frage_smart(frage, lang=lang)
         _zeige_ki_antwort_smart(target_cid, antwort, provider)
     except Exception as e:
+        print(f"[exec_smart_q] Fehler: {e}")
         try:
-            bot.send_message(target_cid, f"❌ Fehler: {e}")
+            bot.send_message(target_cid, _llm_fehler_text(e))
         except: pass
 
 
@@ -4273,7 +4298,8 @@ def _channel_voice_process(m, cid):
         antwort, provider = ki_frage_smart(text)
         _zeige_ki_antwort_smart(cid, antwort, provider)
     except Exception as e:
-        try: bot.send_message(cid, f"❌ {e}")
+        print(f"[voice_channel] Fehler: {e}")
+        try: bot.send_message(cid, _llm_fehler_text(e))
         except: pass
         try: os.unlink(tmp)
         except: pass

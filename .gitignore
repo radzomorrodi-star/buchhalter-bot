@@ -1,11 +1,13 @@
 # Secrets
 .env
 .env.local
+keys.json
 
 # Runtime data — NEVER commit personal bookings
 *.json
 !package.json
 !package-lock.json
+!keys.example.json
 buchungen*.json
 kategorien*.json
 pin.json
