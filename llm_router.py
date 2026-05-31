@@ -1,337 +1,402 @@
 """
-llm_router.py — robuste Multi-Provider LLM-Rotation für den MAMAD / OpenClaw Bot.
+llm_router.py — robuste Multi-Provider LLM-Rotation (Hermes / MAMAD / OpenClaw).
 
-Ziel: Es ist IMMER ein LLM verfügbar. Die Rotation probiert mehrere Provider
-der Reihe nach durch und fällt bei jedem Fehler sauber auf den nächsten zurück.
-Solange MINDESTENS ein Provider einen gültigen Key/Login hat, antwortet der Bot.
+Ziel: Es ist IMMER ein LLM verfügbar. Die Rotation probiert mehrere
+Provider-*Instanzen* der Reihe nach durch und fällt bei jedem Fehler sauber auf
+die nächste zurück. Solange MINDESTENS eine Instanz funktioniert, antwortet der
+Bot — selbst wenn ein Anthropic-Max-Login abläuft.
 
-Warum es vorher ausfiel ("Alle LLM-Provider versagt: anthropic: claude CLI exit 1:
-Not logged in"): die Rotation hing faktisch am interaktiven Claude-CLI-Login —
-läuft der ab, geht alles dunkel. Lösung: ein API-Key-Provider OHNE Browser-Login
-(Groq, gratis & schnell) steht an erster Stelle und garantiert den Fallback.
+NEU (Hermes): mehrere Instanzen DESSELBEN Provider-Typs möglich, z.B.
+2× Anthropic Max-Plan (jeweils eigener OAuth-Token / eigenes Config-Dir) plus
+bis zu 5 API-Key-Provider — alles in EINER Fallback-Kette.
 
-Öffentliche API (vom Bot erwartet):
-    ask(prompt, system=None, max_tokens=512, timeout=30, tools=None) -> (text, provider)
-    load_keys() -> dict  z.B. {"groq": "...", "openai": "...", ...}
+Öffentliche API (unverändert, vom Bot erwartet):
+    ask(prompt, system=None, max_tokens=512, timeout=30, tools=None) -> (text, family)
+    load_keys() -> dict   (flach: {"openai": "...", "groq": "..."} — für OCR)
+    available_providers() -> list[str]
     LLMUnavailableError
 
-Keys werden gelesen aus (Reihenfolge = Priorität):
-    1. Umgebungsvariablen (siehe _ENV_KEYS unten)
-    2. JSON-Datei aus $LLM_KEYS_FILE, sonst ~/.buchhalter-bot/keys.json
-       bzw. /opt/hoy/coding_bot/keys.json  (Format: {"groq": "...", ...})
+Konfiguration (Priorität von oben nach unten):
+    1. keys.json (reich ODER flach) aus $LLM_KEYS_FILE, sonst
+       ~/.buchhalter-bot/keys.json bzw. /opt/hoy/coding_bot/keys.json
+    2. Umgebungsvariablen (GROQ_API_KEY, OPENAI_API_KEY, … siehe _ENV_KEYS)
 
-Reihenfolge der Rotation: $LLM_PROVIDER_ORDER (Komma-separiert),
-Default: groq,anthropic,openai,gemini,deepseek,grok
+Reiches keys.json-Format (empfohlen für Hermes) — siehe keys.example.json:
+    {
+      "providers": [
+        {"name": "groq",        "kind": "groq",          "key": "gsk_..."},
+        {"name": "openai",      "kind": "openai",        "key": "sk-..."},
+        {"name": "gemini",      "kind": "gemini",        "key": "..."},
+        {"name": "deepseek",    "kind": "deepseek",      "key": "..."},
+        {"name": "grok",        "kind": "grok",          "key": "xai-..."},
+        {"name": "claude-max-1","kind": "anthropic-cli", "oauth_token": "sk-ant-oat01-...A"},
+        {"name": "claude-max-2","kind": "anthropic-cli", "oauth_token": "sk-ant-oat01-...B"}
+      ],
+      "order": ["groq", "claude-max-1", "claude-max-2", "openai", "gemini", "deepseek", "grok"]
+    }
 """
 
 import json
 import os
 import subprocess
 import time
+from shutil import which
 
 try:
     import requests
-except ImportError:  # pragma: no cover - requests ist Standard-Dependency
+except ImportError:  # pragma: no cover
     requests = None
 
 
 class LLMUnavailableError(Exception):
-    """Wird geworfen, wenn ALLE Provider fehlschlagen."""
+    """Wird geworfen, wenn ALLE Provider-Instanzen fehlschlagen."""
 
 
-# ── Provider-Definitionen ───────────────────────────────────────────
-# Alle "openai-kompatiblen" Provider teilen denselben /chat/completions-Aufruf.
-_PROVIDERS = {
-    "groq": {
-        "kind": "openai",
-        "base": "https://api.groq.com/openai/v1",
-        "model_env": "GROQ_MODEL",
-        "model": "llama-3.3-70b-versatile",
-    },
-    "openai": {
-        "kind": "openai",
-        "base": "https://api.openai.com/v1",
-        "model_env": "OPENAI_MODEL",
-        "model": "gpt-4o-mini",
-    },
-    "gemini": {
-        "kind": "openai",
-        "base": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "model_env": "GEMINI_MODEL",
-        "model": "gemini-2.0-flash",
-    },
-    "deepseek": {
-        "kind": "openai",
-        "base": "https://api.deepseek.com/v1",
-        "model_env": "DEEPSEEK_MODEL",
-        "model": "deepseek-chat",
-    },
-    "grok": {
-        "kind": "openai",
-        "base": "https://api.x.ai/v1",
-        "model_env": "GROK_MODEL",
-        "model": "grok-2-latest",
-    },
-    "anthropic": {
-        "kind": "anthropic",
-        "base": "https://api.anthropic.com/v1",
-        "model_env": "ANTHROPIC_MODEL",
-        "model": "claude-3-5-sonnet-latest",
-    },
+# ── Provider-Typen (Templates) ──────────────────────────────────────
+# OpenAI-kompatible Endpunkte teilen denselben /chat/completions-Aufruf.
+_OPENAI_KINDS = {
+    "groq":     {"base": "https://api.groq.com/openai/v1",
+                 "model": "llama-3.3-70b-versatile", "family": "groq"},
+    "openai":   {"base": "https://api.openai.com/v1",
+                 "model": "gpt-4o-mini", "family": "openai"},
+    "gemini":   {"base": "https://generativelanguage.googleapis.com/v1beta/openai",
+                 "model": "gemini-2.0-flash", "family": "gemini"},
+    "deepseek": {"base": "https://api.deepseek.com/v1",
+                 "model": "deepseek-chat", "family": "deepseek"},
+    "grok":     {"base": "https://api.x.ai/v1",
+                 "model": "grok-2-latest", "family": "grok"},
 }
+_ANTHROPIC_MODEL = "claude-3-5-sonnet-latest"
 
-# Umgebungsvariablen-Namen je Provider (erster Treffer gewinnt).
+# Env-Vars je Provider-Familie (erster Treffer gewinnt).
 _ENV_KEYS = {
     "groq": ["GROQ_API_KEY", "LLM_API_KEY"],
     "openai": ["OPENAI_API_KEY"],
     "gemini": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
     "deepseek": ["DEEPSEEK_API_KEY"],
     "grok": ["XAI_API_KEY", "GROK_API_KEY"],
-    # sk-ant-api... -> echte API-Keys.  sk-ant-oat... (OAuth) nutzt die CLI.
     "anthropic": ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
 }
 
 _DEFAULT_ORDER = ["groq", "anthropic", "openai", "gemini", "deepseek", "grok"]
 
-# Kurz-Cooldown: ein gerade gescheiterter Provider wird für N Sekunden ans Ende
-# sortiert, damit ein toter Provider nicht jede Anfrage ausbremst. Er wird aber
-# weiterhin als letzter probiert — so bleibt "immer ein LLM verfügbar".
+# Kurz-Cooldown: eine gerade gescheiterte Instanz wird ans Ende sortiert
+# (nicht entfernt!), damit ein toter Provider nicht jede Anfrage ausbremst,
+# aber weiterhin als letzter probiert wird -> "immer ein LLM verfügbar".
 _COOLDOWN_SECONDS = 60
-_cooldown = {}  # provider -> unix_ts bis wann gemieden
+_cooldown = {}  # instance-name -> unix_ts
 
 
-# ── Key-Verwaltung ──────────────────────────────────────────────────
+# ── Konfiguration einlesen ──────────────────────────────────────────
 
 def _keys_file_path():
     explicit = os.environ.get("LLM_KEYS_FILE")
-    candidates = [explicit] if explicit else []
-    candidates += [
+    for p in ([explicit] if explicit else []) + [
         os.path.expanduser("~/.buchhalter-bot/keys.json"),
         "/opt/hoy/coding_bot/keys.json",
-    ]
-    for p in candidates:
+    ]:
         if p and os.path.isfile(p):
             return p
     return None
 
 
-def load_keys():
-    """Sammelt alle verfügbaren Provider-Keys. Env-Vars haben Vorrang vor Datei."""
-    keys = {}
+def _normalize_kind(kind, key="", oauth_token=""):
+    """Mappt Aliase und entscheidet anthropic-api vs anthropic-cli."""
+    k = (kind or "").lower().strip()
+    if k in ("xai", "x.ai", "x-ai"):
+        return "grok"
+    if k in ("google",):
+        return "gemini"
+    if k in ("anthropic", "claude", "anthropic-api", "anthropic-cli"):
+        if k == "anthropic-cli":
+            return "anthropic-cli"
+        if k == "anthropic-api":
+            return "anthropic-api"
+        # generisch: echter API-Key -> API, sonst CLI (OAuth/Subscription)
+        if key.startswith("sk-ant-api"):
+            return "anthropic-api"
+        return "anthropic-cli"
+    return k
 
-    # 1. JSON-Datei (füllt Lücken)
+
+def _make_instance(entry):
+    """Baut eine Instanz-Definition aus einem reichen Config-Eintrag."""
+    raw_kind = entry.get("kind") or entry.get("provider") or ""
+    key = (entry.get("key") or entry.get("api_key") or "").strip()
+    oauth = (entry.get("oauth_token") or entry.get("token") or "").strip()
+    config_dir = (entry.get("config_dir") or "").strip()
+    kind = _normalize_kind(raw_kind, key, oauth)
+
+    if kind in _OPENAI_KINDS:
+        family = _OPENAI_KINDS[kind]["family"]
+    elif kind in ("anthropic-api", "anthropic-cli"):
+        family = "anthropic"
+    else:
+        return None  # unbekannter Typ -> ignorieren
+
+    name = (entry.get("name") or kind).strip()
+    return {
+        "name": name,
+        "kind": kind,
+        "family": family,
+        "key": key,
+        "oauth_token": oauth,
+        "config_dir": config_dir,
+        "model": (entry.get("model") or "").strip(),
+        "base": (entry.get("base") or "").strip(),
+    }
+
+
+def _instances_from_env_and_flat(flat):
+    """Backward-compat: je Familie eine Instanz aus flachem Dict + Env-Vars."""
+    insts = []
+    for family in _DEFAULT_ORDER:
+        if family == "anthropic":
+            key = flat.get("anthropic", "")
+            if key and key.startswith("sk-ant-api"):
+                insts.append(_make_instance({"name": "anthropic", "kind": "anthropic-api", "key": key}))
+            elif key and key.startswith("sk-ant-oat"):
+                insts.append(_make_instance({"name": "anthropic", "kind": "anthropic-cli", "oauth_token": key}))
+            elif which("claude"):
+                # API-Key fehlt, aber Subscription-CLI ist da.
+                insts.append(_make_instance({"name": "anthropic", "kind": "anthropic-cli"}))
+        else:
+            key = flat.get(family, "")
+            if key:
+                insts.append(_make_instance({"name": family, "kind": family, "key": key}))
+    return [i for i in insts if i]
+
+
+def _load_config():
+    """Liefert (instances_in_order, flat_keys_dict)."""
+    flat = {}
+    rich = None
+
+    # 1. keys.json
     path = _keys_file_path()
     if path:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict):
+            if isinstance(data, dict) and isinstance(data.get("providers"), list):
+                rich = data
+            elif isinstance(data, dict):
                 for prov, val in data.items():
                     if val:
-                        keys[prov.lower()] = str(val).strip()
+                        flat[prov.lower()] = str(val).strip()
         except Exception as e:  # pragma: no cover
             print(f"[llm_router] keys.json ({path}) nicht lesbar: {e}")
 
-    # 2. Umgebungsvariablen (überschreiben Datei)
-    for prov, names in _ENV_KEYS.items():
+    # 2. Env-Vars (ergänzen flach, ohne reiches Config zu überschreiben)
+    for family, names in _ENV_KEYS.items():
+        if family in flat:
+            continue
         for name in names:
-            val = os.environ.get(name)
-            if val and val.strip():
-                keys[prov] = val.strip()
+            v = os.environ.get(name)
+            if v and v.strip():
+                flat[family] = v.strip()
                 break
 
-    return keys
+    # Instanzen bauen
+    if rich:
+        insts = [i for i in (_make_instance(e) for e in rich["providers"]) if i]
+        order = rich.get("order")
+    else:
+        insts = _instances_from_env_and_flat(flat)
+        order = None
 
-
-def _claude_cli_available():
-    """anthropic via Subscription-CLI nutzbar, auch ohne API-Key."""
-    from shutil import which
-    return which("claude") is not None
-
-
-def _provider_order():
-    raw = os.environ.get("LLM_PROVIDER_ORDER", "")
-    order = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    # Reihenfolge: explizit (order) > Env LLM_PROVIDER_ORDER > Config-Reihenfolge
     if not order:
-        order = list(_DEFAULT_ORDER)
-    # Unbekannte rausfiltern, fehlende Defaults hinten anhängen
-    order = [p for p in order if p in _PROVIDERS]
-    for p in _DEFAULT_ORDER:
-        if p not in order:
-            order.append(p)
-    return order
+        env_order = os.environ.get("LLM_PROVIDER_ORDER", "")
+        order = [p.strip().lower() for p in env_order.split(",") if p.strip()] or None
+
+    if order:
+        idx = {n.lower(): k for k, n in enumerate(order)}
+        def rank(inst):
+            return idx.get(inst["name"].lower(),
+                           idx.get(inst["family"].lower(), len(order)))
+        insts = sorted(insts, key=rank)
+
+    # flat aus Instanzen ableiten (für load_keys / OCR), Datei-flat ergänzen
+    for inst in insts:
+        if inst["key"] and inst["family"] not in flat:
+            flat[inst["family"]] = inst["key"]
+
+    return insts, flat
+
+
+# ── Öffentliche Helfer ──────────────────────────────────────────────
+
+def load_keys():
+    """Flaches {familie: key}-Dict — vom Bot für OCR/Whisper genutzt."""
+    _, flat = _load_config()
+    return flat
 
 
 def available_providers():
-    """Provider in Rotations-Reihenfolge, die tatsächlich einsetzbar sind."""
-    keys = load_keys()
-    result = []
-    for prov in _provider_order():
-        if keys.get(prov):
-            result.append(prov)
-        elif prov == "anthropic" and _claude_cli_available():
-            # API-Key fehlt, aber die Claude-CLI ist da (Subscription-Login).
-            result.append(prov)
-    return result
+    """Instanz-Namen in Rotations-Reihenfolge, die einsetzbar sind."""
+    insts, _ = _load_config()
+    out = []
+    for i in insts:
+        if i["kind"] in _OPENAI_KINDS and not i["key"]:
+            continue
+        if i["kind"] == "anthropic-api" and not i["key"]:
+            continue
+        if i["kind"] == "anthropic-cli" and not (i["oauth_token"] or which("claude")):
+            continue
+        out.append(i["name"])
+    return out
 
 
-# ── Einzelne Provider-Aufrufe ───────────────────────────────────────
+# ── Provider-Aufrufe ────────────────────────────────────────────────
 
 def _augment_system_for_tools(system, tools):
-    """Der Bot parst JSON aus dem Text. Statt nativer Tool-Calls weisen wir das
-    Modell an, NUR ein passendes JSON-Objekt auszugeben — portabel über alle
-    Provider hinweg."""
+    """Der Bot parst JSON aus dem Text — also weisen wir das Modell an, NUR ein
+    passendes JSON-Objekt auszugeben (portabel über alle Provider)."""
     if not tools:
         return system
     try:
-        schema = tools[0]["function"]["parameters"]
-        schema_str = json.dumps(schema, ensure_ascii=False)
+        schema_str = json.dumps(tools[0]["function"]["parameters"], ensure_ascii=False)
     except Exception:
         schema_str = ""
-    instr = (
-        "Antworte AUSSCHLIESSLICH mit EINEM gültigen JSON-Objekt, "
-        "ohne Markdown, ohne Erklärung, ohne ```-Fences."
-    )
+    instr = ("Antworte AUSSCHLIESSLICH mit EINEM gültigen JSON-Objekt, "
+             "ohne Markdown, ohne Erklärung, ohne ```-Fences.")
     if schema_str:
         instr += f" Es muss diesem JSON-Schema entsprechen: {schema_str}"
     return f"{system}\n\n{instr}" if system else instr
 
 
-def _call_openai_compatible(prov, prompt, system, max_tokens, timeout, key):
-    cfg = _PROVIDERS[prov]
-    model = os.environ.get(cfg["model_env"], "") or cfg["model"]
+def _call_openai_compatible(inst, prompt, system, max_tokens, timeout):
+    tmpl = _OPENAI_KINDS[inst["kind"]]
+    base = inst["base"] or tmpl["base"]
+    model = inst["model"] or os.environ.get(f"{inst['kind'].upper()}_MODEL", "") or tmpl["model"]
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
     resp = requests.post(
-        f"{cfg['base']}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": 0.4,
-        },
+        f"{base}/chat/completions",
+        headers={"Authorization": f"Bearer {inst['key']}", "Content-Type": "application/json"},
+        json={"model": model, "messages": messages,
+              "max_tokens": max_tokens, "temperature": 0.4},
         timeout=timeout,
     )
     if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:160]}")
+    return resp.json()["choices"][0]["message"]["content"]
 
 
-def _call_anthropic_api(prompt, system, max_tokens, timeout, key):
-    cfg = _PROVIDERS["anthropic"]
-    model = os.environ.get(cfg["model_env"], "") or cfg["model"]
-    # OAuth-Tokens (sk-ant-oat...) gehören NICHT an die Messages-API -> CLI.
-    if key.startswith("sk-ant-oat"):
-        raise RuntimeError("OAuth-Token gehört zur CLI, nicht zur Messages-API")
-    headers = {
-        "x-api-key": key,
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }
+def _call_anthropic_api(inst, prompt, system, max_tokens, timeout):
+    model = inst["model"] or os.environ.get("ANTHROPIC_MODEL", "") or _ANTHROPIC_MODEL
+    body = {"model": model, "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}]}
     if system:
         body["system"] = system
     resp = requests.post(
-        f"{cfg['base']}/messages", headers=headers, json=body, timeout=timeout
+        "https://api.anthropic.com/v1/messages",
+        headers={"x-api-key": inst["key"], "anthropic-version": "2023-06-01",
+                 "Content-Type": "application/json"},
+        json=body, timeout=timeout,
     )
     if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:160]}")
     data = resp.json()
-    parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
-    return "".join(parts)
+    return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
 
 
-def _call_claude_cli(prompt, system, timeout):
-    """Letzter Ausweg: die lokale Claude-CLI (Subscription-Login)."""
+def _call_claude_cli(inst, prompt, system, timeout):
+    """Anthropic Max-Plan via lokale Claude-CLI. Jede Instanz kann ihren eigenen
+    OAuth-Token (CLAUDE_CODE_OAUTH_TOKEN) und/oder ihr eigenes Config-Dir
+    (CLAUDE_CONFIG_DIR) haben -> mehrere Max-Accounts parallel rotierbar."""
+    if not which("claude"):
+        raise RuntimeError("claude CLI nicht installiert")
+    env = os.environ.copy()
+    if inst["oauth_token"]:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = inst["oauth_token"]
+        env.pop("ANTHROPIC_API_KEY", None)  # Konflikt vermeiden
+    if inst["config_dir"]:
+        env["CLAUDE_CONFIG_DIR"] = inst["config_dir"]
     full = f"{system}\n\n{prompt}" if system else prompt
     try:
-        proc = subprocess.run(
-            ["claude", "--print", full],
-            capture_output=True, text=True, timeout=timeout,
-        )
-    except FileNotFoundError:
-        raise RuntimeError("claude CLI nicht installiert")
+        proc = subprocess.run(["claude", "--print", full],
+                              capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         raise RuntimeError("claude CLI Timeout")
     if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()[:200]
+        err = (proc.stderr or proc.stdout or "").strip()[:160]
         raise RuntimeError(f"claude CLI exit {proc.returncode}: {err or 'unbekannt'}")
     return proc.stdout.strip()
 
 
-def _call_provider(prov, prompt, system, max_tokens, timeout, key):
-    cfg = _PROVIDERS[prov]
-    if cfg["kind"] == "openai":
-        return _call_openai_compatible(prov, prompt, system, max_tokens, timeout, key)
-    if cfg["kind"] == "anthropic":
-        if key:
-            return _call_anthropic_api(prompt, system, max_tokens, timeout, key)
-        return _call_claude_cli(prompt, system, timeout)
-    raise RuntimeError(f"unbekannter Provider-Typ: {cfg['kind']}")
+def _call_instance(inst, prompt, system, max_tokens, timeout):
+    if inst["kind"] in _OPENAI_KINDS:
+        return _call_openai_compatible(inst, prompt, system, max_tokens, timeout)
+    if inst["kind"] == "anthropic-api":
+        return _call_anthropic_api(inst, prompt, system, max_tokens, timeout)
+    if inst["kind"] == "anthropic-cli":
+        return _call_claude_cli(inst, prompt, system, timeout)
+    raise RuntimeError(f"unbekannter Typ: {inst['kind']}")
 
 
-# ── Öffentliche Rotation ────────────────────────────────────────────
+# ── Rotation ────────────────────────────────────────────────────────
 
 def ask(prompt, system=None, max_tokens=512, timeout=30, tools=None, **_):
-    """Fragt der Reihe nach Provider an, bis einer antwortet.
+    """Fragt Instanzen der Reihe nach an, bis eine antwortet.
 
-    Returns: (text, provider_name)
-    Raises:  LLMUnavailableError, wenn ALLE Provider scheitern.
+    Returns: (text, family)   family z.B. "groq" / "anthropic" (für Emoji im Bot)
+    Raises:  LLMUnavailableError, wenn ALLE Instanzen scheitern.
     """
     if requests is None:
         raise LLMUnavailableError("Modul 'requests' fehlt — pip install requests")
 
-    keys = load_keys()
-    candidates = available_providers()
-    if not candidates:
+    insts, _ = _load_config()
+    # nur einsatzfähige Instanzen
+    usable = []
+    for i in insts:
+        if i["kind"] in _OPENAI_KINDS and not i["key"]:
+            continue
+        if i["kind"] == "anthropic-api" and not i["key"]:
+            continue
+        if i["kind"] == "anthropic-cli" and not (i["oauth_token"] or which("claude")):
+            continue
+        usable.append(i)
+
+    if not usable:
         raise LLMUnavailableError(
-            "Kein LLM konfiguriert. Setze z.B. GROQ_API_KEY (gratis) oder "
-            "lege Keys in keys.json an."
+            "Kein LLM konfiguriert. Setze z.B. GROQ_API_KEY (gratis) oder lege "
+            "Provider in keys.json an (siehe keys.example.json)."
         )
 
-    # Gescheiterte Provider (Cooldown) ans Ende sortieren — aber NICHT entfernen,
-    # damit weiterhin garantiert ein LLM probiert wird.
+    # Gescheiterte Instanzen (Cooldown) ans Ende — aber nicht entfernen.
     now = time.time()
-    candidates.sort(key=lambda p: _cooldown.get(p, 0) > now)
+    usable.sort(key=lambda i: _cooldown.get(i["name"], 0) > now)
 
     system = _augment_system_for_tools(system, tools)
 
     fehler = []
-    for prov in candidates:
+    for inst in usable:
         try:
-            text = _call_provider(prov, prompt, system, max_tokens, timeout, keys.get(prov))
+            text = _call_instance(inst, prompt, system, max_tokens, timeout)
             if not text or not text.strip():
                 raise RuntimeError("leere Antwort")
-            _cooldown.pop(prov, None)  # Erfolg -> Cooldown löschen
-            return text.strip(), prov
+            _cooldown.pop(inst["name"], None)
+            return text.strip(), inst["family"]
         except Exception as e:
-            _cooldown[prov] = time.time() + _COOLDOWN_SECONDS
-            msg = str(e).splitlines()[0][:160] if str(e) else e.__class__.__name__
-            fehler.append(f"{prov}: {msg}")
-            print(f"[llm_router] {prov} fehlgeschlagen: {msg}")
+            _cooldown[inst["name"]] = time.time() + _COOLDOWN_SECONDS
+            msg = (str(e).splitlines()[0][:160] if str(e) else e.__class__.__name__)
+            fehler.append(f"{inst['name']}: {msg}")
+            print(f"[llm_router] {inst['name']} fehlgeschlagen: {msg}")
             continue
 
     raise LLMUnavailableError("Alle LLM-Provider versagt: " + " · ".join(fehler))
 
 
 if __name__ == "__main__":
-    # Smoke-Test:  python llm_router.py "Sag kurz Hallo"
     import sys
-    print("Verfügbare Provider:", available_providers() or "KEINE (Keys fehlen)")
+    print("Verfügbare Instanzen:", available_providers() or "KEINE (Keys fehlen)")
     frage = sys.argv[1] if len(sys.argv) > 1 else "Antworte mit genau einem Wort: OK"
     try:
-        antwort, prov = ask(frage, max_tokens=50, timeout=30)
-        print(f"[{prov}] -> {antwort}")
+        antwort, fam = ask(frage, max_tokens=50, timeout=30)
+        print(f"[{fam}] -> {antwort}")
     except LLMUnavailableError as e:
         print(f"FEHLER: {e}")

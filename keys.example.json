@@ -1,0 +1,16 @@
+{
+  "_hinweis": "Kopiere diese Datei nach keys.json (NICHT committen!) und trage echte Keys ein. Pfad per LLM_KEYS_FILE setzbar, sonst ~/.buchhalter-bot/keys.json oder /opt/hoy/coding_bot/keys.json. Danach: chmod 600 keys.json && systemctl restart <bot>.",
+
+  "providers": [
+    {"name": "groq",         "kind": "groq",          "key": "gsk_DEIN_GROQ_KEY"},
+    {"name": "openai",       "kind": "openai",        "key": "sk-DEIN_OPENAI_KEY"},
+    {"name": "gemini",       "kind": "gemini",        "key": "DEIN_GEMINI_KEY"},
+    {"name": "deepseek",     "kind": "deepseek",      "key": "sk-DEIN_DEEPSEEK_KEY"},
+    {"name": "grok",         "kind": "grok",          "key": "xai-DEIN_GROK_KEY"},
+
+    {"name": "claude-max-1", "kind": "anthropic-cli", "oauth_token": "sk-ant-oat01-ACCOUNT_A"},
+    {"name": "claude-max-2", "kind": "anthropic-cli", "oauth_token": "sk-ant-oat01-ACCOUNT_B"}
+  ],
+
+  "order": ["groq", "claude-max-1", "claude-max-2", "openai", "gemini", "deepseek", "grok"]
+}
