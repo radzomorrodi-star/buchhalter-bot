@@ -5091,6 +5091,18 @@ print("  - Daueraufträge Auto-Buchung ✅")
 print("  - /edit Kategorie-Editor ✅")
 print("  - Voice-Steuerung ✅")
 
+@bot.message_handler(commands=['bot'])
+@auth
+def cmd_bot(m):
+    text = (
+        "🤖 *Verfügbare Bots*\n\n"
+        "[@MoftbarPokerBot](https://t.me/MoftbarPokerBot) — Poker\n"
+        "[@HermesSaharBot](https://t.me/HermesSaharBot) — Sahar\n"
+        "[@HermesNewMamadBot](https://t.me/HermesNewMamadBot) — Mamad\n"
+        "[@mamadOpenClawBot](https://t.me/mamadOpenClawBot) — OpenClaw\n"
+    )
+    bot.send_message(m.chat.id, text, parse_mode='Markdown', disable_web_page_preview=True)
+
 @bot.message_handler(commands=['restart'])
 def cmd_restart_bot(m):
     if m.from_user.id != ADMIN: return
